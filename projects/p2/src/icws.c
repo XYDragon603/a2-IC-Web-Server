@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -16,7 +18,6 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <netinet/tcp.h>
 
 #include "parse.h"
 
@@ -27,6 +28,15 @@
 
 static pthread_mutex_t parser_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * I added g_stop and g_server_fd for graceful shutdown.
+ * Before this, when I pressed Ctrl+C, the server usually died in accept()
+ * and valgrind showed open socket / thread-related leftovers.
+ * This version tries to stop more cleanly.
+ */
+static volatile sig_atomic_t g_stop = 0;
+static int g_server_fd = -1;
+
 typedef struct JobNode {
     int client_fd;
     struct sockaddr_in client_addr;
@@ -36,6 +46,7 @@ typedef struct JobNode {
 typedef struct {
     JobNode *head;
     JobNode *tail;
+    int shutting_down;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 } WorkQueue;
@@ -48,11 +59,85 @@ typedef struct {
     WorkQueue queue;
 } ServerConfig;
 
+//graceful shutdown helpers
+
+
+static void handle_shutdown_signal(int signo) {
+    (void)signo;
+    g_stop = 1;
+
+    /*
+     * close() is async-signal-safe, so it is okay to call here.
+     * I close the listening socket here because otherwise accept()
+     * may keep blocking and the main loop may not stop quickly.
+     */
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+}
+
+static int install_signal_handlers(void) {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_shutdown_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        return -1;
+    }
+    if (sigaction(SIGTERM, &sa, NULL) < 0) {
+        return -1;
+    }
+
+    /*
+     * If client disconnects while we are sending data,
+     * I do not want the whole server to die because of SIGPIPE.
+     */
+    signal(SIGPIPE, SIG_IGN);
+    return 0;
+}
+
+//work queue
+ 
+
 static void work_queue_init(WorkQueue *queue) {
     queue->head = NULL;
     queue->tail = NULL;
+    queue->shutting_down = 0;
     pthread_mutex_init(&queue->mutex, NULL);
     pthread_cond_init(&queue->cond, NULL);
+}
+
+static void work_queue_shutdown(WorkQueue *queue) {
+    pthread_mutex_lock(&queue->mutex);
+    queue->shutting_down = 1;
+
+    /*
+     * Wake up all sleeping workers.
+     * Before this kind of logic, worker threads could stay blocked forever
+     * on the condition variable when the server was stopping.
+     */
+    pthread_cond_broadcast(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+}
+
+static void work_queue_destroy(WorkQueue *queue) {
+    JobNode *cur;
+    JobNode *next;
+
+    cur = queue->head;
+    while (cur != NULL) {
+        next = cur->next;
+        close(cur->client_fd);
+        free(cur);
+        cur = next;
+    }
+
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->cond);
 }
 
 static void work_queue_push(WorkQueue *queue, int client_fd, struct sockaddr_in *client_addr) {
@@ -67,6 +152,18 @@ static void work_queue_push(WorkQueue *queue, int client_fd, struct sockaddr_in 
     node->next = NULL;
 
     pthread_mutex_lock(&queue->mutex);
+
+    /*
+     * If shutdown has started, new jobs should not be accepted anymore.
+     * This avoids pushing new connections into a queue that nobody will serve.
+     */
+    if (queue->shutting_down) {
+        pthread_mutex_unlock(&queue->mutex);
+        close(client_fd);
+        free(node);
+        return;
+    }
+
     if (queue->tail == NULL) {
         queue->head = node;
         queue->tail = node;
@@ -74,6 +171,7 @@ static void work_queue_push(WorkQueue *queue, int client_fd, struct sockaddr_in 
         queue->tail->next = node;
         queue->tail = node;
     }
+
     pthread_cond_signal(&queue->cond);
     pthread_mutex_unlock(&queue->mutex);
 }
@@ -83,8 +181,18 @@ static int work_queue_pop(WorkQueue *queue, struct sockaddr_in *client_addr) {
     int client_fd;
 
     pthread_mutex_lock(&queue->mutex);
-    while (queue->head == NULL) {
+
+    while (queue->head == NULL && !queue->shutting_down) {
         pthread_cond_wait(&queue->cond, &queue->mutex);
+    }
+
+    /*
+     * Return -1 when shutting down and there is no more work.
+     * This gives worker threads a clean way to exit.
+     */
+    if (queue->head == NULL && queue->shutting_down) {
+        pthread_mutex_unlock(&queue->mutex);
+        return -1;
     }
 
     node = queue->head;
@@ -92,6 +200,7 @@ static int work_queue_pop(WorkQueue *queue, struct sockaddr_in *client_addr) {
     if (queue->head == NULL) {
         queue->tail = NULL;
     }
+
     pthread_mutex_unlock(&queue->mutex);
 
     client_fd = node->client_fd;
@@ -99,6 +208,8 @@ static int work_queue_pop(WorkQueue *queue, struct sockaddr_in *client_addr) {
     free(node);
     return client_fd;
 }
+
+//utility helpers
 
 static void format_http_time(time_t t, char *buf, size_t size) {
     struct tm tm_info;
@@ -123,6 +234,8 @@ static const char *get_mime_type(const char *path) {
     if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0) return "image/jpg";
     if (strcasecmp(dot, ".png") == 0) return "image/png";
     if (strcasecmp(dot, ".gif") == 0) return "image/gif";
+    if (strcasecmp(dot, ".json") == 0) return "application/json";
+    if (strcasecmp(dot, ".pdf") == 0) return "application/pdf";
 
     return "application/octet-stream";
 }
@@ -140,7 +253,6 @@ static const char *status_text(int code) {
         default: return "Error";
     }
 }
-
 static int send_all_socket(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t sent = 0;
@@ -155,7 +267,6 @@ static int send_all_socket(int fd, const void *buf, size_t len) {
     }
     return 0;
 }
-
 static int write_all_fd(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t written = 0;
@@ -171,66 +282,33 @@ static int write_all_fd(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-// static int send_error_response(int fd, int status_code, int keep_alive) {
-//     char header[2048];
-//     char body[512];
-//     char date_buf[128];
-//     const char *conn_text = keep_alive ? "keep-alive" : "close";
-//     int body_len;
-//     int header_len;
-
-//     format_http_time(time(NULL), date_buf, sizeof(date_buf));
-//     body_len = snprintf(body, sizeof(body),
-//                         "<html><body><h1>%d %s</h1></body></html>\n",
-//                         status_code, status_text(status_code));
-
-//     header_len = snprintf(header, sizeof(header),
-//                           "HTTP/1.1 %d %s\r\n"
-//                           "Date: %s\r\n"
-//                           "Server: icws-student/3.0\r\n"
-//                           "Connection: %s\r\n"
-//                           "Content-Type: text/html\r\n"
-//                           "Content-Length: %d\r\n"
-//                           "\r\n",
-//                           status_code, status_text(status_code), date_buf, conn_text, body_len);
-
-//     if (send_all_socket(fd, header, (size_t)header_len) < 0) return -1;
-//     if (send_all_socket(fd, body, (size_t)body_len) < 0) return -1;
-//     return 0;
-// }
-
-//Previously, I called send_all_socket twice to send the header and body separately, 
-//but this triggered two underlying TCP transmissions, increasing system call overhead in concurrent situations and potentially causing delays due to the Nagle algorithm.
 static int send_error_response(int fd, int status_code, int keep_alive) {
-    char response[4096]; //Large enough for both
+    char header[2048];
+    char body[512];
     char date_buf[128];
     const char *conn_text = keep_alive ? "keep-alive" : "close";
     int body_len;
-    int total_len;
+    int header_len;
 
     format_http_time(time(NULL), date_buf, sizeof(date_buf));
-    //Calculate body length first
-    char body[512];
     body_len = snprintf(body, sizeof(body),
                         "<html><body><h1>%d %s</h1></body></html>\n",
                         status_code, status_text(status_code));
 
-    //Generate the full HTTP response
-    total_len = snprintf(response, sizeof(response),
+    header_len = snprintf(header, sizeof(header),
                           "HTTP/1.1 %d %s\r\n"
                           "Date: %s\r\n"
                           "Server: icws-student/3.0\r\n"
                           "Connection: %s\r\n"
                           "Content-Type: text/html\r\n"
                           "Content-Length: %d\r\n"
-                          "\r\n"
-                          "%s", //Append body here
-                          status_code, status_text(status_code), date_buf, conn_text, body_len, body);
+                          "\r\n",
+                          status_code, status_text(status_code), date_buf, conn_text, body_len);
 
-    if (send_all_socket(fd, response, (size_t)total_len) < 0) return -1;
+    if (send_all_socket(fd, header, (size_t)header_len) < 0) return -1;
+    if (send_all_socket(fd, body, (size_t)body_len) < 0) return -1;
     return 0;
 }
-
 static int get_header_value(Request *request, const char *name, char *out, size_t out_size) {
     int i;
     for (i = 0; i < request->header_count; i++) {
@@ -244,7 +322,6 @@ static int get_header_value(Request *request, const char *name, char *out, size_
 
 static int client_wants_close(Request *request) {
     char value[4096];
-
     if (get_header_value(request, "Connection", value, sizeof(value))) {
         if (strcasecmp(value, "close") == 0) {
             return 1;
@@ -256,30 +333,26 @@ static int client_wants_close(Request *request) {
 
 static ssize_t find_header_end(const char *buf, size_t len) {
     size_t i;
-
     if (len < 4) return -1;
-
     for (i = 0; i + 3 < len; i++) {
         if (buf[i] == '\r' && buf[i + 1] == '\n' &&
             buf[i + 2] == '\r' && buf[i + 3] == '\n') {
             return (ssize_t)i;
         }
     }
-
     return -1;
 }
 
 static int wait_for_client_data(int client_fd, int timeout_ms) {
     struct pollfd pfd;
     int poll_ret;
-
     pfd.fd = client_fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
-
     while (1) {
         poll_ret = poll(&pfd, 1, timeout_ms);
         if (poll_ret < 0 && errno == EINTR) {
+            if (g_stop) return -1;
             continue;
         }
         return poll_ret;
@@ -288,7 +361,11 @@ static int wait_for_client_data(int client_fd, int timeout_ms) {
 
 static Request *parse_request_thread_safe(char *request_bytes, int req_len, int client_fd) {
     Request *request;
-
+    /*
+     * The yacc/lex parser code is not thread-safe.
+     * Without this mutex, different worker threads could parse at the same time
+     * and corrupt parser state.
+     */
     pthread_mutex_lock(&parser_mutex);
     request = parse(request_bytes, req_len, client_fd);
     pthread_mutex_unlock(&parser_mutex);
@@ -310,6 +387,10 @@ static int build_file_path(const char *root, const char *uri, char *out, size_t 
         *query_pos = '\0';
     }
 
+    /*
+     * I reject ".." and backslash here to block simple path traversal.
+     * Before adding checks like this, a user could try to escape wwwRoot.
+     */
     if (strstr(uri_copy, "..") != NULL || strchr(uri_copy, '\\') != NULL) {
         return -1;
     }
@@ -323,6 +404,46 @@ static int build_file_path(const char *root, const char *uri, char *out, size_t 
     }
 
     return 0;
+}
+
+/*
+ * I changed Content-Length parsing from atoi() to strtol().
+ * Reason: atoi() is too weak for bad input. It cannot report errors well.
+ * With strtol(), I can reject negative numbers, overflow, and junk text.
+ */
+static int parse_content_length_value(const char *value, int *out) {
+    char *endptr;
+    long parsed;
+
+    if (value == NULL || out == NULL) {
+        return 0;
+    }
+
+    while (isspace((unsigned char)*value)) {
+        value++;
+    }
+
+    if (*value == '\0') {
+        return 0;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &endptr, 10);
+
+    if (errno == ERANGE || parsed < 0 || parsed > INT_MAX) {
+        return 0;
+    }
+
+    while (isspace((unsigned char)*endptr)) {
+        endptr++;
+    }
+
+    if (*endptr != '\0') {
+        return 0;
+    }
+
+    *out = (int)parsed;
+    return 1;
 }
 
 static int serve_static_file(int fd, const char *root, Request *request, int keep_alive) {
@@ -567,6 +688,21 @@ static int serve_cgi_request(int fd,
         close(inpipe[0]);
         close(outpipe[1]);
 
+        /*
+         * I used clearenv() because before this, the CGI program inherited
+         * too many desktop / shell environment variables.
+         * It still worked, but the output was messy and not very CGI-like.
+         */
+        clearenv();
+
+        /*
+         * Keep PATH because many scripts use:
+         * #!/usr/bin/env python3
+         * If PATH is missing, env may not find python3.
+         */
+        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+        setenv("LANG", "C.UTF-8", 1);
+
         setenv("GATEWAY_INTERFACE", "CGI/1.1", 1);
         setenv("REQUEST_METHOD", request->http_method, 1);
         setenv("REQUEST_URI", request->http_uri, 1);
@@ -620,6 +756,11 @@ static int serve_cgi_request(int fd,
     close(outpipe[1]);
 
     if (body_len > 0) {
+        /*
+         * This writes POST body into the pipe for the CGI child.
+         * Earlier, a common mistake is using socket-style send() here,
+         * but this fd is a pipe, so write()/write_all_fd() is the correct idea.
+         */
         if (write_all_fd(inpipe[1], body, (size_t)body_len) < 0) {
             close(inpipe[1]);
             close(outpipe[0]);
@@ -653,6 +794,11 @@ static int serve_cgi_request(int fd,
     close(outpipe[0]);
     waitpid(pid, &status, 0);
 
+    /*
+     * If CGI failed before sending anything, return 500.
+     * But if CGI already sent output, do not append another 500 page,
+     * because that would corrupt the HTTP response.
+     */
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         if (bytes_forwarded == 0) {
             return send_error_response(fd, 500, 0);
@@ -676,11 +822,12 @@ static void handle_client(int client_fd,
 
     memset(conn_buf, 0, sizeof(conn_buf));
     memset(client_ip, 0, sizeof(client_ip));
+
     if (client_addr != NULL) {
         inet_ntop(AF_INET, &(client_addr->sin_addr), client_ip, sizeof(client_ip));
     }
 
-    while (1) {
+    while (!g_stop) {
         ssize_t header_pos = find_header_end(conn_buf, used);
 
         if (header_pos < 0) {
@@ -717,7 +864,10 @@ static void handle_client(int client_fd,
             while (1) {
                 ssize_t n = recv(client_fd, conn_buf + used, sizeof(conn_buf) - 1 - used, 0);
                 if (n < 0) {
-                    if (errno == EINTR) continue;
+                    if (errno == EINTR) {
+                        if (g_stop) goto done;
+                        continue;
+                    }
                     goto done;
                 }
                 if (n == 0) {
@@ -756,35 +906,23 @@ static void handle_client(int client_fd,
                 send_error_response(client_fd, 400, 0);
                 break;
             }
-            //// Only enforce the Host header for HTTP/1.1
-            if (strcmp(request->http_version, "HTTP/1.1") == 0 && 
-                !get_header_value(request, "Host", host_value, sizeof(host_value))) {
+
+            if (!get_header_value(request, "Host", host_value, sizeof(host_value))) {
                 send_error_response(client_fd, 400, 0);
                 free_request(request);
                 break;
             }
-            //Allow HTTP/1.1 and HTTP/1.0 to pass, reject other versions (like HTTP/2.0)
-            if (strcmp(request->http_version, "HTTP/1.1") != 0 && 
-                strcmp(request->http_version, "HTTP/1.0") != 0) {
+
+            if (strcmp(request->http_version, "HTTP/1.1") != 0) {
                 send_error_response(client_fd, 505, 0);
                 free_request(request);
                 break;
             }
-            //HTTP/1.1 defaults to Keep-Alive, HTTP/1.0 defaults to Close.
 
-            keep_alive = (strcmp(request->http_version, "HTTP/1.1") == 0) ? 1 : 0;
-            char conn_val[4096];
-            if (get_header_value(request, "Connection", conn_val, sizeof(conn_val))) {
-                if (strcasecmp(conn_val, "keep-alive") == 0) {
-                    keep_alive = 1;
-                } else if (strcasecmp(conn_val, "close") == 0) {
-                    keep_alive = 0;
-                }
-            }
+            keep_alive = !client_wants_close(request);
 
             if (get_header_value(request, "Content-Length", content_length_value, sizeof(content_length_value))) {
-                content_length = atoi(content_length_value);
-                if (content_length < 0) {
+                if (!parse_content_length_value(content_length_value, &content_length)) {
                     send_error_response(client_fd, 400, 0);
                     free_request(request);
                     break;
@@ -803,6 +941,12 @@ static void handle_client(int client_fd,
 
                 if (!get_header_value(request, "Content-Length", content_length_value, sizeof(content_length_value))) {
                     send_error_response(client_fd, 411, 0);
+                    free_request(request);
+                    break;
+                }
+
+                if (!parse_content_length_value(content_length_value, &content_length)) {
+                    send_error_response(client_fd, 400, 0);
                     free_request(request);
                     break;
                 }
@@ -880,6 +1024,11 @@ static void handle_client(int client_fd,
                         request->http_uri,
                         request->http_version);
 
+                /*
+                 * I close the connection after CGI on purpose.
+                 * README says persistent/pipelined CGI support is not necessary here,
+                 * and keeping it simple avoids extra bugs.
+                 */
                 should_close = 1;
             } else {
                 if (strcasecmp(request->http_method, "POST") == 0) {
@@ -923,6 +1072,11 @@ static void handle_client(int client_fd,
                     consumed_from_buffer += body_taken_from_buffer;
                 }
 
+                /*
+                 * Move any extra bytes to the front.
+                 * This is important for keep-alive and pipelining,
+                 * because the next request may already be in the buffer.
+                 */
                 if (used > consumed_from_buffer) {
                     memmove(conn_buf, conn_buf + consumed_from_buffer, used - consumed_from_buffer);
                 }
@@ -948,15 +1102,21 @@ done:
 static void *worker_main(void *arg) {
     ServerConfig *config = (ServerConfig *)arg;
 
-    while (1) {
+    while (!g_stop) {
         struct sockaddr_in client_addr;
         int client_fd = work_queue_pop(&config->queue, &client_addr);
+
+        if (client_fd < 0) {
+            break;
+        }
+
         handle_client(client_fd,
                       config->root,
                       config->cgi_handler,
                       config->listen_port,
                       config->timeout_seconds,
                       &client_addr);
+
         close(client_fd);
     }
 
@@ -1019,8 +1179,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    signal(SIGPIPE, SIG_IGN);
     work_queue_init(&config.queue);
+
+    if (install_signal_handlers() < 0) {
+        perror("sigaction");
+        return 1;
+    }
 
     threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)num_threads);
     if (threads == NULL) {
@@ -1031,6 +1195,11 @@ int main(int argc, char **argv) {
     for (i = 0; i < num_threads; i++) {
         if (pthread_create(&threads[i], NULL, worker_main, &config) != 0) {
             perror("pthread_create");
+            work_queue_shutdown(&config.queue);
+            while (--i >= 0) {
+                pthread_join(threads[i], NULL);
+            }
+            work_queue_destroy(&config.queue);
             free(threads);
             return 1;
         }
@@ -1039,6 +1208,11 @@ int main(int argc, char **argv) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
+        work_queue_shutdown(&config.queue);
+        for (i = 0; i < num_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        work_queue_destroy(&config.queue);
         free(threads);
         return 1;
     }
@@ -1046,6 +1220,11 @@ int main(int argc, char **argv) {
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
         perror("setsockopt");
         close(server_fd);
+        work_queue_shutdown(&config.queue);
+        for (i = 0; i < num_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        work_queue_destroy(&config.queue);
         free(threads);
         return 1;
     }
@@ -1058,6 +1237,11 @@ int main(int argc, char **argv) {
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
         close(server_fd);
+        work_queue_shutdown(&config.queue);
+        for (i = 0; i < num_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        work_queue_destroy(&config.queue);
         free(threads);
         return 1;
     }
@@ -1065,29 +1249,58 @@ int main(int argc, char **argv) {
     if (listen(server_fd, BACKLOG) < 0) {
         perror("listen");
         close(server_fd);
+        work_queue_shutdown(&config.queue);
+        for (i = 0; i < num_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        work_queue_destroy(&config.queue);
         free(threads);
         return 1;
     }
 
+    g_server_fd = server_fd;
+
     printf("Server listening on port %d, root=%s, threads=%d, timeout=%d, cgi=%s\n",
            config.listen_port, config.root, num_threads, config.timeout_seconds, config.cgi_handler);
 
-    while (1) {
+    while (!g_stop) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (g_stop) break;
+                continue;
+            }
+            if (g_stop || errno == EBADF) {
+                break;
+            }
             perror("accept");
             continue;
         }
-        int flag = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
-    
+
         work_queue_push(&config.queue, client_fd, &client_addr);
     }
 
-    close(server_fd);
+    /*
+     * Cleanup part for graceful shutdown.
+     * Before adding this style of cleanup, Ctrl+C often left ugly valgrind output
+     * because workers and socket were not shut down in an orderly way.
+     */
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+
+    work_queue_shutdown(&config.queue);
+
+    for (i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    work_queue_destroy(&config.queue);
     free(threads);
+
     return 0;
 }

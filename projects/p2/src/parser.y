@@ -1,6 +1,6 @@
 /**
  * @file parser.y
- * @brief Grammar for HTTP
+ * @brief Grammar for a small subset of HTTP
  */
 
 %{
@@ -12,6 +12,10 @@ void yyerror(const char *s);
 void set_parsing_options(char *buf, size_t siz, Request *parsing_request);
 extern int yylex(void);
 
+/*
+ * These globals are used by the lexer/parser pair.
+ * The parser reads from parsing_buf instead of stdin.
+ */
 char *parsing_buf;
 int parsing_offset;
 size_t parsing_buf_siz;
@@ -60,12 +64,20 @@ Request *parsing_request;
 
 %%
 
+/*
+ * token is used for things like method name or header name.
+ * I allow normal token chars, digits, and dot here.
+ */
 allowed_char_for_token:
       t_token_char
     | t_digit { $$ = '0' + $1; }
     | t_dot
 ;
 
+/*
+ * Build a token string one character at a time.
+ * Example: G -> GE -> GET
+ */
 token:
       allowed_char_for_token {
           snprintf($$, 8192, "%c", $1);
@@ -96,6 +108,11 @@ text:
       }
 ;
 
+/*
+ * Some header values may be empty, so I use maybe_text.
+ * Example:
+ * Header: \r\n
+ */
 maybe_text:
       {
           $$[0] = 0;
@@ -105,6 +122,10 @@ maybe_text:
       }
 ;
 
+/*
+ * Optional whitespace.
+ * This helps the parser accept slightly different spacing styles.
+ */
 ows:
       {
           $$[0] = 0;
@@ -117,6 +138,13 @@ ows:
       }
 ;
 
+/*
+ * Request line:
+ * METHOD SP URI SP VERSION CRLF
+ *
+ * Example:
+ * GET /index.html HTTP/1.1
+ */
 request_line:
     token t_sp text t_sp text t_crlf {
         strcpy(parsing_request->http_method, $1);
@@ -125,6 +153,14 @@ request_line:
     }
 ;
 
+/*
+ * A single header line:
+ * Header-Name : value
+ * fix:
+ * The starter code only had room for one header.
+ * That is a bug because real HTTP requests can have many headers.
+ * So here I realloc the header array every time I parse a new one.
+ */
 request_header:
     token ows t_colon ows maybe_text ows t_crlf {
         Request_header *new_headers;
@@ -138,8 +174,10 @@ request_header:
         }
 
         parsing_request->headers = new_headers;
+
         strcpy(parsing_request->headers[parsing_request->header_count].header_name, $1);
         strcpy(parsing_request->headers[parsing_request->header_count].header_value, $5);
+
         parsing_request->header_count = new_count;
     }
 ;
@@ -149,6 +187,10 @@ request_headers:
     | request_headers request_header
 ;
 
+/*
+ * A full request for this project:
+ * request line + zero/many headers + final blank line
+ */
 request:
     request_line request_headers t_crlf {
         return SUCCESS;
@@ -157,6 +199,11 @@ request:
 
 %%
 
+/*
+ * Called before yyparse().
+ * This tells lexer/parser which buffer to read from
+ * and which Request struct to fill.
+ */
 void set_parsing_options(char *buf, size_t siz, Request *request) {
     parsing_buf = buf;
     parsing_offset = 0;
