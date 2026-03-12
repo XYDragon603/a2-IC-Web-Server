@@ -306,7 +306,7 @@ int main(int argc, char **argv) {
 
     printf("Milestone 1 Server listening on port %d, root=%s\n", config.listen_port, config.root);
 
-    // Milestone 1: 
+    // Milestone 1: Finally, we will process the request directly in the main thread and close it immediately after processing
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
