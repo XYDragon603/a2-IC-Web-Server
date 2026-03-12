@@ -23,7 +23,7 @@ $(SRC_DIR)/lex.yy.c: $(SRC_DIR)/lexer.l $(SRC_DIR)/y.tab.h
 	$(LEX) -o $@ $(SRC_DIR)/lexer.l
 
 $(SRC_DIR)/y.tab.c $(SRC_DIR)/y.tab.h: $(SRC_DIR)/parser.y
-	$(YACC) -d $(SRC_DIR)/parser.y
+	bison -y -d $(SRC_DIR)/parser.y
 	mv y.tab.c $(SRC_DIR)/y.tab.c
 	mv y.tab.h $(SRC_DIR)/y.tab.h
 
