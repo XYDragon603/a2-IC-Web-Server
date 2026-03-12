@@ -1,0 +1,23 @@
+/home/yunlongli/a2-IC-Web-Server/projects/p2/./cgi-demo/dumper.py:4: DeprecationWarning: 'cgi' is deprecated and slated for removal in Python 3.13
+  import cgi, cgitb
+/home/yunlongli/a2-IC-Web-Server/projects/p2/./cgi-demo/dumper.py:4: DeprecationWarning: 'cgitb' is deprecated and slated for removal in Python 3.13
+  import cgi, cgitb
+127.0.0.1 "POST /cgi/~ HTTP/1.1" CGI
+^C==4576== 
+==4576== FILE DESCRIPTORS: 3 open (3 std) at exit.
+==4576== 
+==4576== HEAP SUMMARY:
+==4576==     in use at exit: 16,458 bytes in 3 blocks
+==4576==   total heap usage: 32 allocs, 29 frees, 256,693 bytes allocated
+==4576== 
+==4576== LEAK SUMMARY:
+==4576==    definitely lost: 0 bytes in 0 blocks
+==4576==    indirectly lost: 0 bytes in 0 blocks
+==4576==      possibly lost: 0 bytes in 0 blocks
+==4576==    still reachable: 16,458 bytes in 3 blocks
+==4576==         suppressed: 0 bytes in 0 blocks
+==4576== Reachable blocks (those to which a pointer was found) are not shown.
+==4576== To see them, rerun with: --leak-check=full --show-leak-kinds=all
+==4576== 
+==4576== For lists of detected and suppressed errors, rerun with: -s
+==4576== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
