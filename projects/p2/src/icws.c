@@ -77,7 +77,6 @@ static int send_error_response(int fd, int status_code) {
                         "<html><body><h1>%d %s</h1></body></html>\n",
                         status_code, status_text(status_code));
 
-    // Milestone 1: 永远返回 Connection: close
     total_len = snprintf(response, sizeof(response),
                           "HTTP/1.1 %d %s\r\n"
                           "Date: %s\r\n"
@@ -227,15 +226,12 @@ static void handle_client(int client_fd, const char *root) {
                 free_request(request);
                 break;
             }
-
-            // Milestone 1: 只支持 GET 和 HEAD
             if (strcasecmp(request->http_method, "GET") != 0 &&
                 strcasecmp(request->http_method, "HEAD") != 0) {
                 send_error_response(client_fd, 501);
                 free_request(request);
                 break;
             }
-
             serve_static_file(client_fd, root, request);
             
             fprintf(stdout, "Processed Milestone 1 Request: %s %s\n", request->http_method, request->http_uri);
